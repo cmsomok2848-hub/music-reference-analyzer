@@ -33,10 +33,18 @@ class JobRequest(BaseModel):
     countries: list[str] = Field(default_factory=lambda: list(DEFAULT_COUNTRIES), max_length=12)
 
 
+class BatchRequest(BaseModel):
+    """Stateless action request sized to complete inside one GPT Action call."""
+
+    tracks: list[Track] = Field(min_length=1, max_length=5)
+    countries: list[str] = Field(default_factory=lambda: list(DEFAULT_COUNTRIES), max_length=12)
+
+
 app = FastAPI(
     title="Official Music Preview Analyzer",
     version="1.0.0",
     description="Resolves lawful official Apple/iTunes previews and returns direct DSP evidence for music-reference analysis.",
+    servers=[{"url": "https://music-reference-analyzer.onrender.com"}],
 )
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 expected_key = os.getenv("ANALYZER_API_KEY", "").strip()
@@ -68,6 +76,31 @@ def status_counts(rows: list[dict]) -> dict[str, int]:
         name = row.get("audio_status", "UNKNOWN")
         counts[name] = counts.get(name, 0) + 1
     return counts
+
+
+def analyze_batch_rows(request: BatchRequest) -> dict:
+    """Analyze up to five previews synchronously; no job id or persistent disk required."""
+
+    tracks = [track.model_dump() for track in request.tracks]
+    countries = tuple(country.upper() for country in request.countries if country.strip())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(tracks))) as pool:
+        rows = list(pool.map(lambda track: process(track, cache_root, countries), tracks))
+    counts = status_counts(rows)
+    return {
+        "method": "Official Apple/iTunes preview bytes, exact-version validation, multi-store retry, and direct DSP",
+        "scope": "PREVIEW_SEGMENTS_NOT_CONFIRMED_SONG_INTROS",
+        "count": len(rows),
+        "status_counts": counts,
+        "audio_coverage": round(counts.get("ANALYZED_PREVIEW", 0) / max(len(rows), 1), 4),
+        "countries_attempted": list(countries),
+        "statistics": summarize_metrics(rows),
+        "tracks": rows,
+        "limits": [
+            "Preview offset may differ from the true song opening.",
+            "Full-song form, payoff, long fatigue and replay remain unconfirmed.",
+            "DSP measures audio behavior; it does not independently prove aesthetic quality.",
+        ],
+    }
 
 
 def run_job(job_id: str, request: JobRequest) -> None:
@@ -160,6 +193,15 @@ def privacy() -> str:
         "downloads lawful official preview files for transient analysis, and stores job results temporarily. "
         "It does not request streaming credentials or extract protected subscription streams."
     )
+
+
+@app.post(
+    "/v1/analyze-batch",
+    dependencies=[Depends(authorize)],
+    operation_id="analyzeMusicPreviewBatch",
+)
+def analyze_batch(request: BatchRequest) -> dict:
+    return analyze_batch_rows(request)
 
 
 @app.post("/v1/jobs", dependencies=[Depends(authorize)], operation_id="createMusicAnalysisJob")
