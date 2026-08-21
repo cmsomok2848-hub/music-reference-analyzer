@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: official-music-preview-analyzer
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: ANALYZER_API_KEY
+        generateValue: true
+      - key: MAX_JOBS
+        value: "1"
+      - key: AUDIO_CACHE_DIR
+        value: /data/audio-cache
+      - key: JOB_DIR
+        value: /data/jobs

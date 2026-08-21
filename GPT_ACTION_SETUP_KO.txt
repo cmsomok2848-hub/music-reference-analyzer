@@ -1,0 +1,14 @@
+GPT 편집 화면에서 다음만 한 번 설정한다.
+
+1. 기능에서 웹 검색과 코드 인터프리터·데이터 분석을 켠다.
+2. 이 폴더를 Docker 지원 호스팅에 배포한다. render.yaml 사용 시 서비스와 비밀키가 자동 생성된다.
+3. GPT 편집 → 작업(Actions) → 새 작업 만들기 → 배포주소/openapi.json 가져오기를 선택한다.
+4. 인증은 API Key, 사용자 지정 헤더 X-API-Key로 고르고 배포 환경의 ANALYZER_API_KEY 값을 넣는다.
+5. 개인정보처리방침 URL은 배포주소/privacy를 사용한다.
+6. GPT 미리보기에서 healthCheck와 3곡 분석을 시험한다.
+
+실사용 시 GPT는 createMusicAnalysisJob으로 30곡을 한 번에 보내고,
+getMusicAnalysisJobStatus를 완료될 때까지 확인한 뒤,
+getMusicAnalysisSummary와 getMusicAnalysisTracks를 순서대로 읽는다.
+
+이 경로는 Spotify·YouTube 재생음을 녹음하지 않는다. Apple/iTunes가 공식적으로 제공하는 preview 파일만 처리한다.

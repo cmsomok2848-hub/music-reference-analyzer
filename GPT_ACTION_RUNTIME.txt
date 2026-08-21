@@ -1,0 +1,7 @@
+REFERENCE FINAL 30곡이 확정되면 createMusicAnalysisJob에 30곡을 Pool과 함께 전송한다. 사용자에게 곡 업로드나 재생을 요구하지 않는다.
+작업이 RUNNING이면 getMusicAnalysisJobStatus를 다시 호출한다. COMPLETE 전에는 C AUDIO를 0으로 확정하거나 Map을 만들지 않는다.
+COMPLETE 후 getMusicAnalysisSummary를 읽고, getMusicAnalysisTracks를 offset 0,5,10,15,20,25로 호출해 전곡 근거를 회수한다.
+ANALYZED_PREVIEW만 C AUDIO로 인정한다. REVIEW_MATCH는 오매치 가능성을 검토하여 Reference를 교체한 뒤 새 작업으로 재분석한다.
+AUDIO_UNAVAILABLE은 다른 동급 Reference로 교체하고 재분석한다. 실제 처리곡의 preview windows와 DSP 수치를 Per-track Ledger에 기록한다.
+Preview 0–5/5–10/10–30은 곡의 실제 Intro라고 부르지 않는다. Full Form·진짜 Opening·장시간 Fatigue는 미확정으로 둔다.
+서버 Action이 접근 불가할 때만 업로드된 analyze_previews.py를 코드 인터프리터에서 직접 실행한다. 웹페이지를 열거나 음악을 재생한 것을 C AUDIO라고 주장하지 않는다.
