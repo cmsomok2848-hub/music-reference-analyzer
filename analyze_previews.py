@@ -17,7 +17,6 @@ import urllib.request
 from difflib import SequenceMatcher
 from pathlib import Path
 
-import librosa
 import numpy as np
 import soundfile as sf
 
@@ -62,9 +61,13 @@ def version_penalty(requested: str, candidate: str) -> float:
 def search_track(artist: str, title: str, countries: tuple[str, ...]) -> dict:
     attempts = []
     best = None
+    deadline = time.monotonic() + 8.0
     query_terms = (f"{artist} {title}", f"{title} {artist}")
     for country in countries:
         for term in query_terms:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             query = urllib.parse.urlencode({
                 "term": term, "entity": "song", "limit": 25, "country": country,
             })
@@ -73,7 +76,7 @@ def search_track(artist: str, title: str, countries: tuple[str, ...]) -> dict:
                 headers={"User-Agent": "MusicReferenceAnalyzer/2.0"},
             )
             try:
-                with urlopen_retry(req, timeout=25, attempts=3) as response:
+                with urlopen_retry(req, timeout=max(1, min(6, int(remaining))), attempts=1) as response:
                     results = json.load(response).get("results", [])
             except Exception as exc:
                 attempts.append({"country": country, "term": term, "error": f"{type(exc).__name__}: {exc}"})
@@ -97,6 +100,8 @@ def search_track(artist: str, title: str, countries: tuple[str, ...]) -> dict:
                 best = (*candidate, country)
                 break
         if best and best[0] >= 0.82 and best[1] >= 0.84 and best[2] >= 0.65:
+            break
+        if time.monotonic() >= deadline:
             break
     if best is None:
         return {"status": "AUDIO_UNAVAILABLE", "reason": "no preview candidate", "attempts": attempts}
@@ -122,7 +127,7 @@ def search_track(artist: str, title: str, countries: tuple[str, ...]) -> dict:
 def download_preview(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(url, headers={"User-Agent": "MusicReferenceAnalyzer/2.0"})
-    with urlopen_retry(req, timeout=45, attempts=3) as response, destination.open("wb") as output:
+    with urlopen_retry(req, timeout=15, attempts=2) as response, destination.open("wb") as output:
         while chunk := response.read(1024 * 256):
             output.write(chunk)
     if destination.stat().st_size < 10_000:
@@ -133,7 +138,7 @@ def download_preview(url: str, destination: Path) -> None:
 def convert_to_wav(source: Path, destination: Path) -> None:
     subprocess.run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
-        "-ar", "44100", "-ac", "2", str(destination),
+        "-ar", "22050", "-ac", "2", str(destination),
     ], check=True)
 
 
@@ -165,19 +170,32 @@ def key_estimate(chroma: np.ndarray) -> dict:
     return {"key": best[1], "scale": best[2], "strength": round(best[0], 4), "margin": round(best[0] - second[0], 4)}
 
 
-def segment_metrics(y: np.ndarray, sr: int, onset_env: np.ndarray, hop: int, start: float, end: float) -> dict:
-    a, b = int(start * sr), min(len(y), int(end * sr))
-    clip = y[a:b]
-    if len(clip) < 32:
+def _frames(y: np.ndarray, frame: int, hop: int) -> np.ndarray:
+    if len(y) < frame:
+        y = np.pad(y, (0, frame - len(y)))
+    count = 1 + (len(y) - frame) // hop
+    shape = (count, frame)
+    strides = (y.strides[0] * hop, y.strides[0])
+    return np.lib.stride_tricks.as_strided(y, shape=shape, strides=strides)
+
+
+def _db(values: np.ndarray) -> np.ndarray:
+    return 20.0 * np.log10(np.maximum(values, 1e-9))
+
+
+def segment_metrics(
+    duration: float, sr: int, hop: int, rms_db: np.ndarray,
+    centroid: np.ndarray, onset_env: np.ndarray, start: float, end: float,
+) -> dict:
+    end = min(end, duration)
+    a, b = int(start * sr / hop), max(int(end * sr / hop), int(start * sr / hop) + 1)
+    if end <= start or a >= len(rms_db):
         return {"start": start, "end": end, "available": False}
-    rms = librosa.feature.rms(y=clip, frame_length=2048, hop_length=hop)[0]
-    c = librosa.feature.spectral_centroid(y=clip, sr=sr, hop_length=hop)[0]
-    onset_a, onset_b = int(start * sr / hop), int(end * sr / hop)
-    oe = onset_env[onset_a:onset_b]
+    rd, ce, oe = rms_db[a:b], centroid[a:b], onset_env[a:b]
     return {
-        "start": start, "end": round(min(end, len(y) / sr), 3), "available": True,
-        "rms_db_mean": round(float(librosa.amplitude_to_db(np.maximum(rms, 1e-9)).mean()), 3),
-        "spectral_centroid_hz": round(float(c.mean()), 2),
+        "start": start, "end": round(end, 3), "available": True,
+        "rms_db_mean": round(float(rd.mean()), 3),
+        "spectral_centroid_hz": round(float(ce.mean()), 2),
         "onset_strength_mean": round(float(oe.mean()) if len(oe) else 0.0, 4),
         "onset_strength_cv": round(float(oe.std() / (oe.mean() + 1e-9)) if len(oe) else 0.0, 4),
     }
@@ -187,42 +205,64 @@ def analyze_wav(path: Path) -> dict:
     stereo, sr = sf.read(path, always_2d=True)
     y = stereo.mean(axis=1).astype(np.float32)
     duration = len(y) / sr
-    hop = 512
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
-    tempo, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop)
-    tempo = scalar(tempo)
-    onset_frames = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr, hop_length=hop, backtrack=False)
-    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
-    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop)[0]
-    rms_db = librosa.amplitude_to_db(np.maximum(rms, 1e-9), ref=1.0)
+    frame, hop = 2048, 512
+    framed = _frames(y, frame, hop)
+    window = np.hanning(frame).astype(np.float32)
+    rms = np.sqrt(np.mean(framed * framed, axis=1) + 1e-12)
+    rms_db = _db(rms)
+    # Positive frame-energy change is a small, reproducible onset envelope.
+    onset_env = np.maximum(0.0, np.diff(rms, prepend=rms[0]))
+    onset_env /= float(onset_env.max() + 1e-12)
+    threshold = float(np.median(onset_env) + 1.5 * np.std(onset_env))
+    onset_frames = np.flatnonzero((onset_env > threshold) & (onset_env >= np.roll(onset_env, 1)) & (onset_env >= np.roll(onset_env, -1)))
+    onset_times = onset_frames * hop / sr
+
+    # Tempo from normalized onset autocorrelation, bounded to a musical 55-190 BPM.
+    centered = onset_env - onset_env.mean()
+    ac = np.correlate(centered, centered, mode="full")[len(centered) - 1:]
+    min_lag = max(1, int(round(60 * sr / (190 * hop))))
+    max_lag = min(len(ac) - 1, int(round(60 * sr / (55 * hop))))
+    lag = min_lag + int(np.argmax(ac[min_lag:max_lag + 1])) if max_lag >= min_lag else 1
+    tempo_raw = 60.0 * sr / (hop * lag)
+    tempo = tempo_raw
+    while tempo < 70.0:
+        tempo *= 2.0
+    while tempo > 145.0:
+        tempo /= 2.0
+    pulse_clarity = float(ac[lag] / (ac[0] + 1e-12)) if len(ac) > lag else 0.0
+    beat_count = max(0, int(round(duration * tempo / 60.0)))
+
     peak = float(np.max(np.abs(stereo)))
     crest = 20 * math.log10((peak + 1e-9) / (float(np.sqrt(np.mean(stereo ** 2))) + 1e-9))
-    stft = librosa.stft(y, n_fft=4096, hop_length=hop)
-    power = np.abs(stft) ** 2
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=4096)
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
-    harmonic, percussive = librosa.effects.hpss(y)
-    h_rms = float(np.sqrt(np.mean(harmonic ** 2)))
-    p_rms = float(np.sqrt(np.mean(percussive ** 2)))
-    centroid = librosa.feature.spectral_centroid(S=np.abs(stft), sr=sr)[0]
-    bandwidth = librosa.feature.spectral_bandwidth(S=np.abs(stft), sr=sr)[0]
-    flatness = librosa.feature.spectral_flatness(S=np.abs(stft))[0]
-
-    pulse_clarity = 0.0
-    if len(onset_env) > 8 and tempo > 0:
-        ac = librosa.autocorrelate(onset_env, max_size=len(onset_env) // 2)
-        lag = int(round((60.0 / tempo) * sr / hop))
-        if 0 < lag < len(ac):
-            pulse_clarity = float(ac[lag] / (ac[0] + 1e-9))
+    freqs = np.fft.rfftfreq(frame, 1.0 / sr)
+    power_sum = np.zeros(len(freqs), dtype=np.float64)
+    centroid_values, bandwidth_values, flatness_values = [], [], []
+    chroma_energy = np.zeros(12, dtype=np.float64)
+    # Process small blocks to stay below Render free-tier memory limits.
+    for start in range(0, len(framed), 64):
+        block = framed[start:start + 64] * window
+        power = np.abs(np.fft.rfft(block, axis=1)) ** 2
+        power_sum += power.sum(axis=0)
+        denom = power.sum(axis=1) + 1e-12
+        cent = (power * freqs).sum(axis=1) / denom
+        centroid_values.extend(cent.tolist())
+        bandwidth_values.extend(np.sqrt((power * (freqs[None, :] - cent[:, None]) ** 2).sum(axis=1) / denom).tolist())
+        flatness_values.extend((np.exp(np.mean(np.log(power + 1e-12), axis=1)) / (np.mean(power, axis=1) + 1e-12)).tolist())
+    centroid = np.asarray(centroid_values)
+    bandwidth = np.asarray(bandwidth_values)
+    flatness = np.asarray(flatness_values)
+    valid = freqs >= 40
+    midi = np.rint(69 + 12 * np.log2(np.maximum(freqs[valid], 1e-9) / 440.0)).astype(int)
+    for pc in range(12):
+        chroma_energy[pc] = power_sum[valid][midi % 12 == pc].sum()
+    chroma = chroma_energy[:, None]
+    flux_proxy = float(np.mean(onset_env))
+    harmonic_percussive_proxy = float((1.0 - min(flux_proxy, 0.999)) / (flux_proxy + 1e-6))
 
     offbeat_ratio = None
-    if len(beats) >= 3 and len(onset_frames):
-        beat_times = librosa.frames_to_time(beats, sr=sr, hop_length=hop)
-        interval = float(np.median(np.diff(beat_times)))
-        distances = []
-        for t in onset_times:
-            phase = ((t - beat_times[0]) / max(interval, 1e-6)) % 1.0
-            distances.append(min(abs(phase), abs(phase - 0.5), abs(phase - 1.0)))
+    if beat_count >= 3 and len(onset_frames):
+        beat_times = np.arange(0, duration, 60.0 / max(tempo, 1e-6))
+        interval = 60.0 / max(tempo, 1e-6)
         # Events nearer the half-beat grid than the beat grid indicate subdivision/offbeat activity.
         beat_dist = [min(((t - beat_times[0]) / max(interval, 1e-6)) % 1.0, 1 - (((t - beat_times[0]) / max(interval, 1e-6)) % 1.0)) for t in onset_times]
         half_dist = [abs((((t - beat_times[0]) / max(interval, 1e-6)) % 1.0) - 0.5) for t in onset_times]
@@ -238,9 +278,9 @@ def analyze_wav(path: Path) -> dict:
         side_mid = float(np.sqrt(np.mean(side ** 2)) / (np.sqrt(np.mean(mid ** 2)) + 1e-9))
 
     segments = [
-        segment_metrics(y, sr, onset_env, hop, 0, 5),
-        segment_metrics(y, sr, onset_env, hop, 5, 10),
-        segment_metrics(y, sr, onset_env, hop, 10, min(30, duration)),
+        segment_metrics(duration, sr, hop, rms_db, centroid, onset_env, 0, 5),
+        segment_metrics(duration, sr, hop, rms_db, centroid, onset_env, 5, 10),
+        segment_metrics(duration, sr, hop, rms_db, centroid, onset_env, 10, min(30, duration)),
     ]
     carry_delta = None
     if segments[1].get("available") and segments[2].get("available"):
@@ -251,7 +291,8 @@ def analyze_wav(path: Path) -> dict:
         "duration_seconds": round(duration, 3),
         "sample_rate": sr,
         "tempo_bpm_estimate": round(tempo, 3),
-        "beat_count": int(len(beats)),
+        "tempo_bpm_raw_autocorrelation": round(tempo_raw, 3),
+        "beat_count": beat_count,
         "pulse_clarity": round(pulse_clarity, 4),
         "onsets_per_second": round(len(onset_frames) / duration, 4),
         "offbeat_subdivision_ratio_estimate": None if offbeat_ratio is None else round(offbeat_ratio, 4),
@@ -265,19 +306,19 @@ def analyze_wav(path: Path) -> dict:
             "crest_factor_db": round(crest, 3),
         },
         "spectrum": {
-            "sub_20_80_ratio": round(band_ratio(power, freqs, 20, 80), 5),
-            "bass_80_250_ratio": round(band_ratio(power, freqs, 80, 250), 5),
-            "low_mid_250_500_ratio": round(band_ratio(power, freqs, 250, 500), 5),
-            "mid_500_2000_ratio": round(band_ratio(power, freqs, 500, 2000), 5),
-            "presence_2000_6000_ratio": round(band_ratio(power, freqs, 2000, 6000), 5),
-            "air_6000_20000_ratio": round(band_ratio(power, freqs, 6000, 20000), 5),
+            "sub_20_80_ratio": round(band_ratio(power_sum, freqs, 20, 80), 5),
+            "bass_80_250_ratio": round(band_ratio(power_sum, freqs, 80, 250), 5),
+            "low_mid_250_500_ratio": round(band_ratio(power_sum, freqs, 250, 500), 5),
+            "mid_500_2000_ratio": round(band_ratio(power_sum, freqs, 500, 2000), 5),
+            "presence_2000_6000_ratio": round(band_ratio(power_sum, freqs, 2000, 6000), 5),
+            "air_6000_20000_ratio": round(band_ratio(power_sum, freqs, 6000, min(20000, sr / 2 + 1)), 5),
             "centroid_hz_mean": round(float(centroid.mean()), 2),
             "bandwidth_hz_mean": round(float(bandwidth.mean()), 2),
             "flatness_mean": round(float(flatness.mean()), 5),
         },
         "texture": {
-            "harmonic_to_percussive_rms_ratio": round(h_rms / (p_rms + 1e-9), 4),
-            "zero_crossing_rate": round(float(librosa.feature.zero_crossing_rate(y)[0].mean()), 5),
+            "harmonic_to_percussive_rms_ratio": round(harmonic_percussive_proxy, 4),
+            "zero_crossing_rate": round(float(np.mean(np.abs(np.diff(np.signbit(y))))), 5),
         },
         "stereo": {
             "channel_correlation": None if stereo_corr is None else round(stereo_corr, 4),

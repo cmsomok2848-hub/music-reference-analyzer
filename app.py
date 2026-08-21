@@ -83,7 +83,9 @@ def analyze_batch_rows(request: BatchRequest) -> dict:
 
     tracks = [track.model_dump() for track in request.tracks]
     countries = tuple(country.upper() for country in request.countries if country.strip())
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(tracks))) as pool:
+    # Two lightweight workers stay within small Render memory while finishing
+    # five-track GPT Action batches before the request timeout.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(tracks))) as pool:
         rows = list(pool.map(lambda track: process(track, cache_root, countries), tracks))
     counts = status_counts(rows)
     return {
